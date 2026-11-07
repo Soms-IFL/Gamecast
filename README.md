@@ -1,4 +1,4 @@
-# IFL Simulator — International Football League
+# IFL Gamecast — International Football League
 
 A broadcast-style American football simulator for the IFL. The server runs the season on its own schedule, and everyone who opens the site watches the same game, play by play, at the same moment. Each game takes about 7 minutes (about 8 with overtime).
 
