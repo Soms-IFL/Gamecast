@@ -493,11 +493,15 @@ const admin = {
   },
 };
 
+// ------------------------------------------------------------------ public API (read-only, see API.md)
+const publicApi = require('./api.js')({ IFL, getDb: () => db, liveGame, estimateEnd, findLogos });
+
 // ------------------------------------------------------------------ server
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
   try {
+    if (p === '/api/v1' || p.startsWith('/api/v1/')) return publicApi.handle(req, res, p.slice('/api/v1'.length), url.searchParams);
     if (p === '/api/state' && req.method === 'GET') {
       const since = +url.searchParams.get('rev');
       if (since && since === db.rev) return send(res, 200, { rev: db.rev, now: Date.now(), unchanged: true });

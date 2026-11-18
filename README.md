@@ -53,6 +53,7 @@ Without the service, run `./start.sh`, inside `screen` or `tmux` so it keeps run
 | `setup.bat` / `setup-windows.ps1` | Windows setup. Double-click `setup.bat`. |
 | `setup.sh` | Linux setup: `bash setup.sh`. |
 | `server.js` | The league server: schedule, broadcasts, saving, admin API. No extra packages needed. |
+| `api.js` / `API.md` | The public read-only data API (`/api/v1`) and its reference. |
 | `public/` | The website: `index.html`, `app.js` (interface) and `engine.js` (game simulation). |
 | `data/` | Created on first run. `league.json` holds the current season and all history; `config.json` holds the port and admin password. **Back this folder up.** |
 
@@ -173,6 +174,10 @@ The Bowl also gets a short pregame break after the semifinals on finals day. Whi
 - **Season:** IFL West and IFL East standings, the playoff picture, the schedule with air times, results and league leaders. Any finished game can be **replayed** at your own pace (1×–10×).
 - **History:** champions, all-time standings, league records, and every past season's standings, leaders and results, all replayable.
 - **Exhibition** (top of the Live tab): play any matchup on your own screen. It's not saved and doesn't affect the league.
+
+## Public API
+
+The server also exposes a read-only JSON API for bots, overlays, stats sites and other tools: standings, schedules, live scores, play-by-play, box scores, rosters and leaders. No key is needed and it never shows anything before it has aired. Try `http://localhost:3000/api/v1/status`. Full reference in [API.md](API.md). Environment variable `IFL_API_RATE` sets the per-IP limit (default 120 requests a minute, `0` for no limit).
 
 ## Notes
 
