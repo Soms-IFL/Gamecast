@@ -37,7 +37,8 @@ module.exports = function createApi(ctx) {
   const iso = ms => (ms == null ? null : new Date(ms).toISOString());
   const int = (v, d, lo, hi) => { if (v == null || v === '') return d; const n = Math.floor(+v); if (!Number.isFinite(n)) throw bad('Expected a whole number, got "' + v + '".'); return Math.max(lo, Math.min(hi, n)); };
   const round = (x, n) => { const k = Math.pow(10, n); return Math.round(x * k) / k; };
-  const gameStatus = (g, now) => g.result ? 'final' : (g.airStart != null && g.airStart <= now && now < g.airStart + (g.dur || 0)) ? 'live' : 'scheduled';
+  // A game whose airtime is over counts as final even in the second before the server records its result.
+  const gameStatus = (g, now) => g.result ? 'final' : (g.airStart == null || now < g.airStart) ? 'scheduled' : now < g.airStart + (g.dur || 0) ? 'live' : 'final';
 
   // "season" = the current season or an archived one, in one shape
   function seasonOf(q) {
@@ -66,17 +67,17 @@ module.exports = function createApi(ctx) {
   function venueOut(v) { return v ? { name: v.name || null, town: v.town || null, host: v.host || null } : null; }
 
   // ------------------------------------------------------------ simulation cache (games are deterministic)
-  const simCache = new Map();
-  function remember(key, make) {
-    if (simCache.has(key)) { const v = simCache.get(key); simCache.delete(key); simCache.set(key, v); return v; }
-    const v = make(); simCache.set(key, v);
-    if (simCache.size > 24) simCache.delete(simCache.keys().next().value);
+  const fullCache = new Map(), partCache = new Map(); // two LRUs so live snapshots never evict whole-game sims
+  function remember(cache, max, key, make) {
+    if (cache.has(key)) { const v = cache.get(key); cache.delete(key); cache.set(key, v); return v; }
+    const v = make(); cache.set(key, v);
+    if (cache.size > max) cache.delete(cache.keys().next().value);
     return v;
   }
   const gameOpts = (g, rosters) => ({ playoff: !!g.playoff, rosters, out: g.out || [], venue: g.venue || undefined });
   const gameKey = (se, g) => [se.number, g.gid, g.seed, (g.out || []).join(','), g.venue ? g.venue.host + g.venue.town : ''].join('|');
   function fullSim(se, g) { // the finished game plus its broadcast timeline
-    return remember('full|' + gameKey(se, g), () => {
+    return remember(fullCache, 24, gameKey(se, g), () => {
       const sim = IFL.simulateGame(g.home, g.away, g.seed, gameOpts(g, se.rosters));
       return { sim, tl: IFL.timeline(sim.events, IFL.stageOf(g)) };
     });
@@ -84,7 +85,7 @@ module.exports = function createApi(ctx) {
   // How many plays of a game on air have finished airing (same rule the web client uses).
   function playsAired(tl, elapsed) { let n = 0; while (n < tl.length && tl[n].start + tl[n].pre + tl[n].act <= elapsed) n++; return n; }
   function partialSim(se, g, n) { // a fresh Game stepped n plays forward: running stats and state
-    return remember('part|' + n + '|' + gameKey(se, g), () => {
+    return remember(partCache, 8, n + '|' + gameKey(se, g), () => {
       const game = new IFL.Game(g.home, g.away, Object.assign({ seed: g.seed }, gameOpts(g, se.rosters)));
       for (let i = 0; i < n; i++) game.step();
       return game;
@@ -107,7 +108,11 @@ module.exports = function createApi(ctx) {
   }
   function scoreOut(g, now, se) {
     const status = gameStatus(g, now);
-    if (status === 'final') { const r = g.result; return { status, home: r.score[0], away: r.score[1], ot: !!r.ot }; }
+    if (status === 'final') {
+      let r = g.result;
+      if (!r) { const sim = fullSim(se, g).sim; r = { score: sim.score, ot: sim.qtr >= 5 }; } // just finished airing, result not recorded yet
+      return { status, home: r.score[0], away: r.score[1], ot: !!r.ot };
+    }
     if (status === 'live' && se.current) { const v = liveView(se, g, now); return { status, home: v.state.score[0], away: v.state.score[1], ot: v.state.qtr >= 5 }; }
     return { status, home: null, away: null, ot: false };
   }
@@ -160,7 +165,7 @@ module.exports = function createApi(ctx) {
 
   route(/^$/, () => ({
     name: 'IFL Gamecast API', version: 1, docs: 'See API.md in the project, or request the links below.',
-    endpoints: ['status', 'teams', 'teams/{id}', 'standings', 'games', 'games/live', 'games/{id}', 'games/{id}/plays', 'players/{id}', 'leaders', 'seasons', 'seasons/{n}'].map(e => '/api/v1/' + e),
+    endpoints: ['status', 'teams', 'teams/{id}', 'standings', 'games', 'games/live', 'games/{id}', 'games/{id}/plays', 'games/live/stream', 'games/{id}/stream', 'players/{id}', 'leaders', 'seasons', 'seasons/{n}'].map(e => '/api/v1/' + e),
     notes: 'Read-only. Add ?season=N to most endpoints to look at an archived season. Times are ISO-8601 UTC plus epoch ms. Nothing is revealed before it has aired.',
   }));
 
@@ -352,6 +357,113 @@ module.exports = function createApi(ctx) {
     res.end(JSON.stringify(body, null, 2));
   }
 
+  // ------------------------------------------------------------ live streams (Server-Sent Events)
+  // GET /games/live/stream follows whichever game is on air (and idles between games).
+  // GET /games/{id}/stream follows one game, waits for it to start, and closes after it ends.
+  // Events: state (on connect / new game), play, score, idle, final, end. Ids look like "W1G1:17" (game:play number),
+  // so a reconnecting EventSource resumes after the last play it saw. Only plays that have finished airing are sent.
+  const MAX_STREAMS_PER_IP = process.env.IFL_API_STREAMS != null ? +process.env.IFL_API_STREAMS : 5; // 0 = off
+  const MAX_STREAMS = 1000;
+  const clients = new Set();
+  let streamTimer = null;
+  const sseWrite = (c, event, data, id) => c.res.write((id != null ? 'id: ' + id + '\n' : '') + 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n');
+  function closeStream(c, event, data) {
+    if (!clients.delete(c)) return;
+    try { if (event) sseWrite(c, event, data); c.res.end(); } catch (e) {}
+    if (!clients.size && streamTimer) { clearInterval(streamTimer); streamTimer = null; }
+  }
+  function parseEventId(raw, defaultGid) { // "W1G1:17" or a bare "17" (meaning that game)
+    const m = typeof raw === 'string' && raw.match(/^(?:([A-Za-z0-9_-]+):)?(\d{1,6})$/);
+    return m ? { gid: (m[1] || defaultGid || '').toUpperCase(), n: +m[2] } : null;
+  }
+  const playsNow = (se, g, now, status) => { const { sim, tl } = fullSim(se, g); return status === 'final' ? sim.events.length : playsAired(tl, Math.max(0, now - g.airStart)); };
+  function streamState(se, g, now) { // gameDetail without the heavy parts
+    const d = gameDetail(se, g, now, {});
+    delete d.box; delete d.scoring; delete d.recentPlays; delete d.inactive;
+    return d;
+  }
+  function attach(c, se, g, now) { // start following game g; decide which play to resume after
+    const status = gameStatus(g, now), total = status === 'scheduled' ? 0 : playsNow(se, g, now, status);
+    const li = c.lastId;
+    c.gid = g.gid; c.idle = false;
+    if (li && li.gid === g.gid.toUpperCase()) c.sent = Math.min(li.n, total);   // reconnect: replay what was missed
+    else if (li || c.switched) c.sent = 0;                                       // a different/new game: from its first play
+    else c.sent = total;                                                         // fresh connect: from right now
+    c.lastId = null;
+    const evs = status === 'scheduled' ? null : fullSim(se, g).sim.events;
+    c.score = c.sent && evs ? evs[c.sent - 1].post.score.slice() : [0, 0];
+    sseWrite(c, 'state', streamState(se, g, now));
+  }
+  function pump(c, se, g, now) { // send the plays that have finished airing since last time
+    const status = gameStatus(g, now);
+    if (status === 'scheduled') return;
+    const { sim } = fullSim(se, g), upto = playsNow(se, g, now, status);
+    for (; c.sent < upto; c.sent++) {
+      const ev = sim.events[c.sent], p = playOut(ev, c.sent, g.home, g.away);
+      sseWrite(c, 'play', p, g.gid + ':' + p.n);
+      const sc = ev.post.score;
+      if (sc[0] !== c.score[0] || sc[1] !== c.score[1]) { c.score = sc.slice(); sseWrite(c, 'score', { play: p.n, home: sc[0], away: sc[1], scoringTeam: p.scoringTeam }); }
+    }
+    if (status !== 'final') return;
+    const fin = { id: g.gid, season: se.number, status: 'final', home: { id: g.home, score: sim.score[0] }, away: { id: g.away, score: sim.score[1] }, overtime: sim.qtr >= 5,
+      winner: sim.score[0] > sim.score[1] ? g.home : sim.score[1] > sim.score[0] ? g.away : null, quarters: quartersOut(sim), plays: sim.events.length };
+    sseWrite(c, 'final', fin);
+    if (c.mode === 'game') return closeStream(c);
+    c.gid = null; c.idle = false; c.switched = true; // live mode: wait for the next game
+  }
+  function stepClient(c, now) {
+    const S = getDb().season;
+    if (!S || S.number !== c.season) return closeStream(c, 'end', { reason: 'The season changed. Reconnect to follow the new one.' });
+    const se = seasonOf(new URLSearchParams());
+    if (now - c.ping >= 15000) { c.res.write(': ping\n\n'); c.ping = now; }
+    if (c.mode === 'live') {
+      if (!c.gid) {
+        const lg = liveGame(now);
+        if (lg) attach(c, se, lg, now);
+        else if (!c.idle) {
+          const nx = S.games.filter(x => !x.result && x.airStart != null && x.airStart > now).sort((a, b) => a.airStart - b.airStart)[0];
+          sseWrite(c, 'idle', { now: iso(now), next: nx ? gameSummary(se, nx, now) : null }); c.idle = true;
+          c.switched = true; // whatever airs next is followed from its first play
+        }
+      }
+      if (!c.gid) return;
+    }
+    const g = S.games.find(x => x.gid === c.gid);
+    if (!g) return closeStream(c, 'end', { reason: 'Game no longer exists.' });
+    pump(c, se, g, now);
+  }
+  function tickStreams() {
+    const now = Date.now();
+    for (const c of Array.from(clients)) {
+      if (c.res.destroyed || c.res.writableEnded) { closeStream(c); continue; }
+      try { stepClient(c, now); } catch (e) { console.error('Stream error:', e); closeStream(c, 'end', { reason: 'Server error' }); }
+    }
+  }
+  function openStream(req, res, spec, query) {
+    const now = Date.now(), ip = req.socket.remoteAddress || '?';
+    const se = seasonOf(new URLSearchParams()); // streams always follow the current season
+    const mode = spec.toLowerCase() === 'live' ? 'live' : 'game';
+    const g = mode === 'game' ? findGame(se, spec) : null;
+    const raw = req.headers['last-event-id'] || query.get('since');
+    const lastId = raw ? parseEventId(String(raw), g && g.gid) : null;
+    if (raw && !lastId) throw bad('since / Last-Event-ID must look like 17 or W1G1:17.');
+    let mine = 0; for (const c of clients) if (c.ip === ip) mine++;
+    if (clients.size >= MAX_STREAMS || (MAX_STREAMS_PER_IP > 0 && mine >= MAX_STREAMS_PER_IP)) throw new HttpError(429, 'Too many open streams from this address.');
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff', 'Access-Control-Allow-Origin': '*' });
+    res.write('retry: 3000\n\n');
+    const c = { res, ip, mode, season: se.number, gid: null, sent: 0, score: [0, 0], lastId, idle: false, switched: false, ping: now };
+    clients.add(c);
+    req.on('close', () => closeStream(c));
+    if (!streamTimer) streamTimer = setInterval(tickStreams, 500);
+    try {
+      if (mode === 'game') attach(c, se, g, now);
+      stepClient(c, now); // live mode attaches to the game on air, or sends "idle"
+    } catch (e) { // headers are already out, so end the stream instead of replying with an error status
+      console.error('Stream error:', e);
+      closeStream(c, 'end', { reason: 'Server error' });
+    }
+  }
+
   // path is everything after /api/v1/
   function handle(req, res, path, query) {
     if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Max-Age': '86400' }); return res.end(); }
@@ -360,6 +472,8 @@ module.exports = function createApi(ctx) {
     if (wait) return reply(res, 429, { error: 'Too many requests. Try again in ' + wait + 's.' }, { 'Retry-After': String(wait) });
     const clean = path.replace(/^\/+|\/+$/g, '');
     try {
+      const sm = req.method === 'GET' && clean.match(/^games\/([A-Za-z0-9_-]+)\/stream$/);
+      if (sm) return openStream(req, res, sm[1], query);
       for (const [re, fn] of routes) {
         const m = clean.match(re);
         if (m) return reply(res, 200, fn(query, Date.now(), m));

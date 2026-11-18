@@ -7,7 +7,7 @@ A public, read-only JSON API for the league. It runs inside the normal server, s
 - **No spoilers.** The API never shows more than a viewer of the broadcast knows. A game that has not aired has no score and no plays. A game on air only shows the plays that have *finished airing*, with the score as of that moment.
 - **Times** are ISO-8601 UTC strings (`startsAt`) with an epoch-milliseconds twin (`startsAtMs`).
 - **Seasons.** Most endpoints take `?season=N` for an archived season. Leave it out for the current one.
-- **Rate limit.** 120 requests per minute per IP by default (HTTP 429 with `Retry-After` beyond that). Change it with the `IFL_API_RATE` environment variable; `0` turns it off. Behind a reverse proxy every visitor shares the proxy's IP, so raise or disable it there.
+- **Rate limit.** 120 requests per minute per IP by default (HTTP 429 with `Retry-After` beyond that). Change it with the `IFL_API_RATE` environment variable; `0` turns it off. Opening a stream counts as one request. Behind a reverse proxy every visitor shares the proxy's IP, so raise or disable it there.
 - **Errors** are `{ "error": "message" }` with a normal status code: `400` bad parameter, `404` not found, `405` wrong method, `429` too many requests.
 
 ## Endpoints
@@ -22,6 +22,7 @@ A public, read-only JSON API for the league. It runs inside the normal server, s
 | `GET /api/v1/games/live` | The game on air right now, with situation, score, win probability, box score and recent plays. `{ "live": false }` when nothing is on. |
 | `GET /api/v1/games/{id}` | One game (`W1G1`, `P-SF1`, `P-SF2`, `P-F` for the IFL Bowl). Content depends on its status, see below. |
 | `GET /api/v1/games/{id}/plays` | Play-by-play, oldest first. Supports polling with `?since=`. |
+| `GET /api/v1/games/live/stream`, `GET /api/v1/games/{id}/stream` | Live push stream (Server-Sent Events) of plays, scores and the final. See [Live streams](#live-streams-server-sent-events). |
 | `GET /api/v1/players/{id}` | One player (`MIS-QB1`): team, rating, age, injury, season stats. |
 | `GET /api/v1/leaders` | Season stat leaders. |
 | `GET /api/v1/seasons` | Every season with its champion and runner-up. |
@@ -56,6 +57,37 @@ GET /api/v1/games/W1G1/plays?since=17     ->  { total: 21, next: 21, plays: [4 n
 ```
 
 Each play has `n`, `quarter`, `clock` (before the snap), `situation` (for example `4th & 2 at MIS 22`), `text`, `kind`, `possession`, `tags`, `banner`, `scoringTeam` and the `score` after the play.
+
+### Live streams (Server-Sent Events)
+
+Instead of polling, open a stream and the server pushes each play the moment it finishes airing. No library is needed in a browser:
+
+```js
+const es = new EventSource('/api/v1/games/live/stream');
+es.addEventListener('play',  e => console.log(JSON.parse(e.data).text));
+es.addEventListener('score', e => console.log('score', JSON.parse(e.data)));
+es.addEventListener('final', e => console.log('final', JSON.parse(e.data)));
+```
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /api/v1/games/live/stream` | Follows whichever game is on air. Between games it sits idle, and the next game is picked up from its first play. Never closes by itself. |
+| `GET /api/v1/games/{id}/stream` | Follows one game. Waits if it hasn't started, closes after `final`. A game that is already over sends `state` and `final` and closes. |
+
+Streams always follow the current season. The same no-spoiler rule applies as everywhere else.
+
+| Event | When | Data |
+|---|---|---|
+| `state` | On connect, and when a new game is picked up | The same fields as `/games/{id}` without the box score: game, situation, line score, win probability. `progress.playsAired` says which play the stream continues from. |
+| `play` | Each play that finishes airing | A play, exactly as in `/plays`. |
+| `score` | After a play that changed the score | `{ play, home, away, scoringTeam }` |
+| `idle` | Live stream only: nothing on air | `{ now, next }` where `next` is the next scheduled game. |
+| `final` | The game ended | Final score, `winner`, `overtime`, line score, number of plays. |
+| `end` | The server is closing the stream | `{ reason }`, for example when a new season starts. |
+
+**Resuming.** Every `play` has an id like `W1G1:17` (game and play number). A browser's `EventSource` reconnects by itself and sends it back as `Last-Event-ID`, so any plays missed during the drop are replayed. Other clients can pass `?since=W1G1:17`, or a bare `?since=17` on a per-game stream. A fresh connection with neither starts from right now.
+
+**Limits.** At most 5 open streams per IP and 1000 in total, with `429` beyond that (`IFL_API_STREAMS` changes the per-IP number, `0` for no limit). The server sends a `: ping` comment every 15 seconds to keep the connection alive through proxies. It sets `X-Accel-Buffering: no` so nginx streams it without extra configuration.
 
 ### `/leaders`
 
@@ -104,4 +136,5 @@ Team stat lines (`box.home.stats`, `box.away.stats`): `fd` first downs, `plays`,
 
 - The API code is in `api.js`; `server.js` only mounts it at `/api/v1`. It never writes to the league data.
 - Games are deterministic from their seed, so box scores and play-by-play are rebuilt on demand and the last 24 are kept in memory. A cold request for one game costs a few milliseconds.
+- All open streams share one 500 ms timer, which only runs while someone is connected.
 - `/api/state`, `/api/history` and `/api/admin/*` are what the website itself uses. They are not stable. Build on `/api/v1`.

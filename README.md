@@ -177,7 +177,7 @@ The Bowl also gets a short pregame break after the semifinals on finals day. Whi
 
 ## Public API
 
-The server also exposes a read-only JSON API for bots, overlays, stats sites and other tools: standings, schedules, live scores, play-by-play, box scores, rosters and leaders. No key is needed and it never shows anything before it has aired. Try `http://localhost:3000/api/v1/status`. Full reference in [API.md](API.md). Environment variable `IFL_API_RATE` sets the per-IP limit (default 120 requests a minute, `0` for no limit).
+The server also exposes a read-only JSON API for bots, overlays, stats sites and other tools: standings, schedules, live scores, play-by-play, box scores, rosters and leaders. No key is needed and it never shows anything before it has aired. It includes a live stream (Server-Sent Events) that pushes each play as it airs. Try `http://localhost:3000/api/v1/status`. Full reference in [API.md](API.md). Environment variable `IFL_API_RATE` sets the per-IP limit (default 120 requests a minute, `0` for no limit).
 
 ## Notes
 
